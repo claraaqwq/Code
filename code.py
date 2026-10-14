@@ -2,6 +2,7 @@ import os
 import re
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import ttkbootstrap as tb
 from pathlib import Path
 
 import pandas as pd
@@ -79,12 +80,17 @@ class MappingBox(ttk.LabelFrame):
         return self.vars[label].get()
 
 
-class App(tk.Tk):
+class App(tb.Window):
     def __init__(self):
-        super().__init__()
+        super().__init__(themename="darkly")
         self.title(APP_TITLE)
-        self.geometry("1120x820")
-        self.minsize(1000, 720)
+        self.geometry("1220x860")
+        self.minsize(1080, 760)
+        self.style.configure("Accent.TButton", background="#FFE600", foreground="#111111",
+                             font=("Segoe UI Semibold", 10), padding=(14, 8))
+        self.style.map("Accent.TButton", background=[("active", "#FFD400")],
+                       foreground=[("active", "#111111")])
+        self.style.configure("Secondary.TButton", font=("Segoe UI", 10), padding=(12, 7))
 
         self.je_files = []
         self.tb_beg_path = ""
@@ -99,71 +105,54 @@ class App(tk.Tk):
         self._build_ui()
 
     def _build_ui(self):
-        main = ttk.Frame(self, padding=12)
-        main.pack(fill="both", expand=True)
+        outer = ttk.Frame(self, padding=(24, 20))
+        outer.pack(fill="both", expand=True)
 
-        title = ttk.Label(main, text="Tracing Validator", font=("Segoe UI", 18, "bold"))
-        title.pack(anchor="w")
-        ttk.Label(
-            main,
-            text="Carga JE(s), TB Beginning, TB Ending y Rollforward; mapea columnas y genera un Excel de tracing por GLA."
-        ).pack(anchor="w", pady=(0, 10))
+        header = ttk.Frame(outer)
+        header.pack(fill="x", pady=(0, 18))
+        accent = tk.Frame(header, width=7, height=58, bg="#FFE600")
+        accent.pack(side="left", padx=(0, 14)); accent.pack_propagate(False)
+        titlebox = ttk.Frame(header); titlebox.pack(side="left")
+        ttk.Label(titlebox, text="TRACING", font=("Segoe UI", 23, "bold")).pack(anchor="w")
+        ttk.Label(titlebox, text="VALIDATOR", foreground="#FFE600", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        ttk.Label(header, text="GLA + BUSINESS UNIT  â¢  RECONCILIATION WORKSPACE",
+                  foreground="#999999", font=("Segoe UI", 9, "bold")).pack(side="right", anchor="s", pady=6)
 
-        files = ttk.LabelFrame(main, text="1. Archivos", padding=10)
-        files.pack(fill="x")
+        files = ttk.LabelFrame(outer, text="  01  SOURCE FILES  ", padding=14)
+        files.pack(fill="x", pady=(0, 12)); files.columnconfigure(1, weight=1)
+        def frow(r,label,cmd,attr):
+            ttk.Label(files,text=label,font=("Segoe UI Semibold",10)).grid(row=r,column=0,sticky="w",padx=(0,12),pady=5)
+            w=ttk.Label(files,text="Not selected",foreground="#999999"); w.grid(row=r,column=1,sticky="w",pady=5)
+            setattr(self,attr,w)
+            ttk.Button(files,text="Browse",style="Secondary.TButton",command=cmd).grid(row=r,column=2,sticky="e",pady=5)
+        frow(0,"Journal Entries",self.add_je,"je_label")
+        frow(1,"TB Beginning",lambda:self.pick_single("tb_beg"),"tb_beg_label")
+        frow(2,"TB Ending",lambda:self.pick_single("tb_end"),"tb_end_label")
+        frow(3,"Rollforward",lambda:self.pick_single("rf"),"rf_label")
+        ttk.Button(files,text="LOAD WORKBOOKS  â",style="Accent.TButton",command=self.load_files).grid(row=4,column=2,sticky="e",pady=(10,0))
 
-        ttk.Button(files, text="Agregar JE(s)", command=self.add_je).grid(row=0, column=0, sticky="w")
-        self.je_label = ttk.Label(files, text="NingÃºn JE seleccionado")
-        self.je_label.grid(row=0, column=1, sticky="w", padx=10)
+        wrap=ttk.LabelFrame(outer,text="  02  FIELD MAPPING  ",padding=12); wrap.pack(fill="both",expand=True,pady=(0,12))
+        mappings=ttk.Frame(wrap); mappings.pack(fill="both",expand=True)
+        self.je_map=MappingBox(mappings,"JOURNAL ENTRIES",["GLA","Business Unit","Amount"])
+        self.tb_beg_map=MappingBox(mappings,"TB BEGINNING",["GLA","Business Unit","Amount"])
+        self.tb_end_map=MappingBox(mappings,"TB ENDING",["GLA","Business Unit","Amount"])
+        self.rf_map=MappingBox(mappings,"ROLLFORWARD",["GLA","Business Unit","Beginning","Variance","Ending"])
+        self.je_map.grid(row=0,column=0,sticky="nsew",padx=(0,6),pady=(0,6)); self.tb_beg_map.grid(row=0,column=1,sticky="nsew",padx=(6,0),pady=(0,6))
+        self.tb_end_map.grid(row=1,column=0,sticky="nsew",padx=(0,6),pady=(6,0)); self.rf_map.grid(row=1,column=1,sticky="nsew",padx=(6,0),pady=(6,0))
+        mappings.columnconfigure(0,weight=1); mappings.columnconfigure(1,weight=1)
 
-        ttk.Button(files, text="TB Beginning", command=lambda: self.pick_single("tb_beg")).grid(row=1, column=0, sticky="w", pady=4)
-        self.tb_beg_label = ttk.Label(files, text="No seleccionado")
-        self.tb_beg_label.grid(row=1, column=1, sticky="w", padx=10)
-
-        ttk.Button(files, text="TB Ending", command=lambda: self.pick_single("tb_end")).grid(row=2, column=0, sticky="w", pady=4)
-        self.tb_end_label = ttk.Label(files, text="No seleccionado")
-        self.tb_end_label.grid(row=2, column=1, sticky="w", padx=10)
-
-        ttk.Button(files, text="Rollforward", command=lambda: self.pick_single("rf")).grid(row=3, column=0, sticky="w", pady=4)
-        self.rf_label = ttk.Label(files, text="No seleccionado")
-        self.rf_label.grid(row=3, column=1, sticky="w", padx=10)
-
-        ttk.Button(files, text="Leer archivos / elegir hojas", command=self.load_files).grid(
-            row=4, column=0, columnspan=2, sticky="w", pady=(8, 0)
-        )
-
-        mappings = ttk.Frame(main)
-        mappings.pack(fill="both", expand=True, pady=10)
-
-        self.je_map = MappingBox(mappings, "JE (todos deben usar el mismo mapping)", ["GLA", "Business Unit", "Amount"])
-        self.tb_beg_map = MappingBox(mappings, "TB Beginning", ["GLA", "Business Unit", "Amount"])
-        self.tb_end_map = MappingBox(mappings, "TB Ending", ["GLA", "Business Unit", "Amount"])
-        self.rf_map = MappingBox(mappings, "Rollforward", ["GLA", "Business Unit", "Beginning", "Variance", "Ending"])
-
-        self.je_map.grid(row=0, column=0, sticky="nsew", padx=(0, 5), pady=5)
-        self.tb_beg_map.grid(row=0, column=1, sticky="nsew", padx=(5, 0), pady=5)
-        self.tb_end_map.grid(row=1, column=0, sticky="nsew", padx=(0, 5), pady=5)
-        self.rf_map.grid(row=1, column=1, sticky="nsew", padx=(5, 0), pady=5)
-        mappings.columnconfigure(0, weight=1)
-        mappings.columnconfigure(1, weight=1)
-
-        run = ttk.LabelFrame(main, text="2. Cuenta a trazar", padding=10)
-        run.pack(fill="x")
-
-        ttk.Label(run, text="GLA:").grid(row=0, column=0, sticky="w")
-        self.account_var = tk.StringVar()
-        self.account_combo = ttk.Combobox(run, textvariable=self.account_var, width=35)
-        self.account_combo.grid(row=0, column=1, padx=8, sticky="w")
-
-        ttk.Label(run, text="Tolerancia:").grid(row=0, column=2, sticky="w", padx=(20, 0))
-        self.tolerance_var = tk.StringVar(value=str(TOLERANCE))
-        ttk.Entry(run, textvariable=self.tolerance_var, width=12).grid(row=0, column=3, padx=8)
-
-        ttk.Button(run, text="Actualizar lista de GLA", command=self.refresh_accounts).grid(row=0, column=4, padx=8)
-        ttk.Button(run, text="Generar tracing Excel", command=self.generate).grid(row=0, column=5, padx=8)
-
-        self.status = ttk.Label(main, text="")
-        self.status.pack(anchor="w", pady=(8, 0))
+        run=ttk.LabelFrame(outer,text="  03  RUN TRACING  ",padding=14); run.pack(fill="x")
+        ttk.Label(run,text="GLA ACCOUNT",font=("Segoe UI Semibold",9)).grid(row=0,column=0,sticky="w")
+        self.account_var=tk.StringVar(); self.account_combo=ttk.Combobox(run,textvariable=self.account_var,width=28)
+        self.account_combo.grid(row=1,column=0,padx=(0,12),pady=(4,0))
+        ttk.Label(run,text="TOLERANCE",font=("Segoe UI Semibold",9)).grid(row=0,column=1,sticky="w")
+        self.tolerance_var=tk.StringVar(value=str(TOLERANCE)); ttk.Entry(run,textvariable=self.tolerance_var,width=14).grid(row=1,column=1,padx=(0,12),pady=(4,0))
+        ttk.Button(run,text="REFRESH GLA",style="Secondary.TButton",command=self.refresh_accounts).grid(row=1,column=2,padx=(0,10),pady=(4,0))
+        ttk.Button(run,text="GENERATE TRACING  â",style="Accent.TButton",command=self.generate).grid(row=1,column=3,pady=(4,0))
+        statusbar=ttk.Frame(outer,padding=(10,7)); statusbar.pack(fill="x",pady=(12,0))
+        ttk.Label(statusbar,text="â",foreground="#FFE600").pack(side="left",padx=(0,6))
+        self.status=ttk.Label(statusbar,text="Ready",foreground="#BBBBBB"); self.status.pack(side="left")
+        ttk.Label(statusbar,text="Functional tracing  |  GLA + Business Unit",foreground="#777777").pack(side="right")
 
     def add_je(self):
         paths = filedialog.askopenfilenames(
