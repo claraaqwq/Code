@@ -1,4 +1,6 @@
 import re
+import threading
+import queue
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
@@ -99,6 +101,7 @@ class App(tb.Window):
         self.rf_path = ""
 
         self.je_df = self.tb_beg_df = self.tb_end_df = self.rf_df = None
+        self._load_queue = queue.Queue()
         self._build_ui()
 
     def _build_ui(self):
@@ -143,9 +146,10 @@ class App(tb.Window):
         file_row(2, "TB Ending", lambda: self.pick_single("tb_end"), "tb_end_label")
         file_row(3, "Rollforward", lambda: self.pick_single("rf"), "rf_label")
 
-        ttk.Button(
+        self.load_button = ttk.Button(
             files, text="LOAD WORKBOOKS  â", style="Accent.TButton", command=self.load_files
-        ).grid(row=4, column=2, sticky="e", pady=(8, 0))
+        )
+        self.load_button.grid(row=4, column=2, sticky="e", pady=(8, 0))
 
         # Mappings
         wrap = ttk.LabelFrame(outer, text="  02  FIELD MAPPING  ", padding=10)
@@ -249,50 +253,131 @@ class App(tb.Window):
         return result["sheet"]
 
     def load_files(self):
+        """
+        Select sheets on the UI thread, then read large workbooks in a worker
+        thread so Tkinter does not freeze/crash while pandas/openpyxl is busy.
+        """
         if not self.je_files or not self.tb_beg_path or not self.tb_end_path or not self.rf_path:
-            messagebox.showerror("Missing files", "Select JE(s), TB Beginning, TB Ending and Rollforward.")
+            messagebox.showerror(
+                "Missing files",
+                "Select JE(s), TB Beginning, TB Ending and Rollforward."
+            )
             return
+
         try:
-            je_parts = []
-            expected_cols = None
+            selections = {"je": []}
+
+            # Dialogs must stay on Tkinter's main thread.
             for path in self.je_files:
                 sh = self.choose_sheet(path, "JE sheet")
                 if not sh:
                     return
+                selections["je"].append((path, sh))
+
+            sh = self.choose_sheet(self.tb_beg_path, "TB Beginning sheet")
+            if not sh:
+                return
+            selections["tb_beg"] = (self.tb_beg_path, sh)
+
+            sh = self.choose_sheet(self.tb_end_path, "TB Ending sheet")
+            if not sh:
+                return
+            selections["tb_end"] = (self.tb_end_path, sh)
+
+            sh = self.choose_sheet(self.rf_path, "Rollforward sheet")
+            if not sh:
+                return
+            selections["rf"] = (self.rf_path, sh)
+
+            self.load_button.configure(state="disabled")
+            self.status.config(text="Loading Excel filesâ¦ the window will remain responsive.")
+            self.update_idletasks()
+
+            worker = threading.Thread(
+                target=self._load_files_worker,
+                args=(selections,),
+                daemon=True
+            )
+            worker.start()
+            self.after(150, self._poll_load_queue)
+
+        except Exception as exc:
+            self.load_button.configure(state="normal")
+            messagebox.showerror("Load error", str(exc))
+
+    def _load_files_worker(self, selections):
+        try:
+            je_parts = []
+            expected_cols = None
+
+            for path, sh in selections["je"]:
                 df = read_excel(path, sh)
                 original_cols = list(df.columns)
+
                 if expected_cols is None:
                     expected_cols = original_cols
                 elif original_cols != expected_cols:
                     raise ValueError(
                         "The selected JE files do not have the same column structure.\n"
-                        "This version requires all JE files to use the same columns."
+                        "All JE files must use the same columns in this version."
                     )
+
                 df["Source_File"] = Path(path).name
                 je_parts.append(df)
-            self.je_df = pd.concat(je_parts, ignore_index=True)
 
-            sh = self.choose_sheet(self.tb_beg_path, "TB Beginning sheet")
-            if not sh: return
-            self.tb_beg_df = read_excel(self.tb_beg_path, sh)
+            # concat(copy=False) reduces avoidable memory duplication.
+            je_df = pd.concat(je_parts, ignore_index=True, copy=False)
 
-            sh = self.choose_sheet(self.tb_end_path, "TB Ending sheet")
-            if not sh: return
-            self.tb_end_df = read_excel(self.tb_end_path, sh)
+            path, sh = selections["tb_beg"]
+            tb_beg_df = read_excel(path, sh)
 
-            sh = self.choose_sheet(self.rf_path, "Rollforward sheet")
-            if not sh: return
-            self.rf_df = read_excel(self.rf_path, sh)
+            path, sh = selections["tb_end"]
+            tb_end_df = read_excel(path, sh)
 
-            self.je_map.set_columns([c for c in self.je_df.columns if c != "Source_File"])
-            self.tb_beg_map.set_columns(self.tb_beg_df.columns)
-            self.tb_end_map.set_columns(self.tb_end_df.columns)
-            self.rf_map.set_columns(self.rf_df.columns)
+            path, sh = selections["rf"]
+            rf_df = read_excel(path, sh)
 
-            self.status.config(text="Files loaded. Complete the field mapping.")
-            messagebox.showinfo("Loaded", "Files loaded successfully. Now map the required fields.")
+            self._load_queue.put(("ok", (je_df, tb_beg_df, tb_end_df, rf_df)))
+
         except Exception as exc:
-            messagebox.showerror("Load error", str(exc))
+            self._load_queue.put(("error", str(exc)))
+
+    def _poll_load_queue(self):
+        try:
+            status, payload = self._load_queue.get_nowait()
+        except queue.Empty:
+            self.after(150, self._poll_load_queue)
+            return
+
+        self.load_button.configure(state="normal")
+
+        if status == "error":
+            self.status.config(text="Load failed.")
+            messagebox.showerror("Load error", payload)
+            return
+
+        self.je_df, self.tb_beg_df, self.tb_end_df, self.rf_df = payload
+
+        self.je_map.set_columns([c for c in self.je_df.columns if c != "Source_File"])
+        self.tb_beg_map.set_columns(self.tb_beg_df.columns)
+        self.tb_end_map.set_columns(self.tb_end_df.columns)
+        self.rf_map.set_columns(self.rf_df.columns)
+
+        self.status.config(
+            text=f"Loaded: {len(self.je_df):,} JE rows | "
+                 f"{len(self.tb_beg_df):,} TB Beg | "
+                 f"{len(self.tb_end_df):,} TB End | "
+                 f"{len(self.rf_df):,} RF"
+        )
+        messagebox.showinfo(
+            "Loaded",
+            "Files loaded successfully.\n\n"
+            f"JE rows: {len(self.je_df):,}\n"
+            f"TB Beginning rows: {len(self.tb_beg_df):,}\n"
+            f"TB Ending rows: {len(self.tb_end_df):,}\n"
+            f"Rollforward rows: {len(self.rf_df):,}\n\n"
+            "Now map the required fields."
+        )
 
     def validate_mapping(self):
         checks = [
