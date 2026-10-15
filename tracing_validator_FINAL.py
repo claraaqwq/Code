@@ -1,6 +1,10 @@
 import re
 import threading
 import queue
+import json
+import time
+import tempfile
+import os
 import tkinter as tk
 from tkinter import ttk, filedialog
 from pathlib import Path
@@ -71,6 +75,7 @@ def read_headers_fast(path, sheet, header_row):
 from tracing_sqlite_cache import (
     load_gla_index, build_gla_index, read_excel_filtered_by_gla,
     set_cache_directory,
+    OperationCancelled, check_cancelled,
 )
 
 
@@ -146,9 +151,14 @@ class App(tb.Window):
         self.rf_columns = []
         self.ui_queue = queue.Queue()
         self.worker_running = False
+        self.cancel_event = threading.Event()
+        self.operation_started = None
+        self.disabled_controls = []
+        self.closing_requested = False
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self.confirm_close)
         self.after(100, self._process_ui_queue)
+        self.after(250, self._update_elapsed)
 
     def _build_ui(self):
         viewport = ttk.Frame(self)
@@ -240,6 +250,12 @@ class App(tb.Window):
                    command=self.load_files).grid(row=0, column=0, sticky="ew", padx=(0, 6))
         ttk.Button(buttons_row, text="BUILD / REFRESH CACHE", style="Secondary.TButton",
                    command=self.build_cache).grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        settings = ttk.Frame(files)
+        settings.grid(row=6, column=0, columnspan=5, sticky="e", pady=(10, 0))
+        ttk.Button(settings, text="SAVE CONFIGURATION", style="Secondary.TButton",
+                   command=self.save_configuration).pack(side="left", padx=(0, 8))
+        ttk.Button(settings, text="LOAD CONFIGURATION", style="Secondary.TButton",
+                   command=self.load_configuration).pack(side="left")
 
         maps = ttk.Frame(outer)
         maps.pack(fill="both", expand=True)
@@ -326,6 +342,146 @@ class App(tb.Window):
         self.progress.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(14, 4))
         self.progress_text = ttk.Label(run, text="Ready", foreground="#BBBBBB")
         self.progress_text.grid(row=3, column=0, columnspan=4, sticky="w")
+        self.elapsed_text = ttk.Label(run, text="Elapsed: 00:00", foreground="#BBBBBB")
+        self.elapsed_text.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.cancel_button = ttk.Button(run, text="CANCEL PROCESS", style="Secondary.TButton",
+                                        state="disabled", command=self.cancel_operation)
+        self.cancel_button.grid(row=4, column=3, sticky="e", pady=(8, 0))
+
+    def _start_operation(self):
+        self.cancel_event.clear()
+        self.operation_started = time.monotonic()
+        self.worker_running = True
+        self.progress_var.set(0)
+        self.elapsed_text.configure(text="Elapsed: 00:00")
+        self.disabled_controls = []
+
+        def disable(parent):
+            for widget in parent.winfo_children():
+                if widget == self.cancel_button:
+                    continue
+                if isinstance(widget, (ttk.Button, ttk.Entry, ttk.Combobox)):
+                    self.disabled_controls.append((widget, str(widget.cget("state"))))
+                    widget.configure(state="disabled")
+                disable(widget)
+        disable(self)
+        self.cancel_button.configure(state="normal")
+
+    def _finish_operation(self):
+        self.worker_running = False
+        for widget, state in self.disabled_controls:
+            widget.configure(state=state)
+        self.disabled_controls = []
+        self.generate_button.configure(state="normal", text="GENERATE WORKING PAPER")
+        self.cancel_button.configure(state="disabled")
+
+    def _update_elapsed(self):
+        if self.worker_running and self.operation_started is not None:
+            seconds = int(time.monotonic() - self.operation_started)
+            self.elapsed_text.configure(text=f"Elapsed: {seconds // 60:02d}:{seconds % 60:02d}")
+        self.after(250, self._update_elapsed)
+
+    def cancel_operation(self):
+        if self.worker_running:
+            self.cancel_event.set()
+            self.cancel_button.configure(state="disabled")
+            self.progress_text.configure(text="Cancelling... waiting for the current step to stop safely.")
+
+    def _configuration(self):
+        return {
+            "version": 1, "je_files": self.je_files, "je_sheets": self.je_sheets,
+            "paths": {k: getattr(self, k + "_path") for k in ("tb_beg", "tb_end", "rf")},
+            "sheets": {k: getattr(self, k + "_sheet") for k in ("tb_beg", "tb_end", "rf")},
+            "headers": {k: getattr(self, k + "_header_var").get() for k in ("je", "tb_beg", "tb_end", "rf")},
+            "mappings": {k: {r: v.get() for r, v in getattr(self, k + "_map").vars.items()}
+                         for k in ("je", "tb_beg", "tb_end", "rf")},
+            "manual_sources": {k: getattr(self, k + "_manual_source_var").get() for k in ("tb_beg", "tb_end")},
+            "level": self.rf_level_var.get(), "tolerance": self.tolerance_var.get(),
+            "account": self.account_var.get(), "cache_folder": self.cache_directory_var.get(),
+        }
+
+    def save_configuration(self):
+        if self.worker_running:
+            return
+        path = filedialog.asksaveasfilename(parent=self, title="Save configuration",
+                                            defaultextension=".json", filetypes=[("Configuration", "*.json")])
+        if not path:
+            return
+        try:
+            descriptor, temporary = tempfile.mkstemp(prefix=".tracing-config-", suffix=".json", dir=Path(path).parent)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    json.dump(self._configuration(), stream, ensure_ascii=False, indent=2)
+                Path(temporary).replace(path)
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+            self.show_message("Configuration saved", "Files, worksheets, mappings and cache folder have been saved.")
+        except Exception as exc:
+            self.show_error("Configuration error", str(exc))
+
+    def load_configuration(self):
+        if self.worker_running:
+            return
+        path = filedialog.askopenfilename(parent=self, title="Load configuration", filetypes=[("Configuration", "*.json")])
+        if not path:
+            return
+        try:
+            cfg = json.loads(Path(path).read_text(encoding="utf-8"))
+            # Validate and read headers before modifying the current setup.
+            if cfg["version"] != 1 or not isinstance(cfg["je_files"], list):
+                raise ValueError("Unsupported configuration format.")
+            if cfg["level"] not in self.rf_level_combo["values"]:
+                raise ValueError("Invalid Rollforward level.")
+            headers = {k: int(cfg["headers"][k]) for k in ("je", "tb_beg", "tb_end", "rf")}
+            if min(headers.values()) < 1:
+                raise ValueError("Header rows must be 1 or greater.")
+            float(cfg["tolerance"])
+            columns = {}
+            for source in cfg["je_files"]:
+                cols = (read_headers_fast(source, cfg["je_sheets"][source], headers["je"])
+                        if cfg["je_sheets"].get(source) else [])
+                columns.setdefault("je", cols)
+            for k in ("tb_beg", "tb_end", "rf"):
+                columns[k] = (read_headers_fast(cfg["paths"][k], cfg["sheets"][k], headers[k])
+                              if cfg["paths"][k] and cfg["sheets"][k] else [])
+            for k in ("je", "tb_beg", "tb_end", "rf"):
+                for role in getattr(self, k + "_map").vars:
+                    if not isinstance(cfg["mappings"][k][role], str):
+                        raise ValueError("Invalid mapping in configuration.")
+            for k in ("tb_beg", "tb_end"):
+                if not isinstance(cfg["manual_sources"][k], str):
+                    raise ValueError("Invalid manual Source.")
+            account = str(cfg["account"])
+            folder = cfg["cache_folder"]
+            if not isinstance(folder, str):
+                raise ValueError("Invalid cache folder.")
+            if folder:
+                set_cache_directory(folder)
+            self.je_files = cfg["je_files"]
+            self.je_sheets = cfg["je_sheets"]
+            self.je_label.configure(text=f"{len(self.je_files)} file(s) selected" if self.je_files else "Not selected")
+            self.rf_level_var.set(cfg["level"])
+            self.on_rollforward_level_change()
+            for k in ("tb_beg", "tb_end", "rf"):
+                setattr(self, k + "_path", cfg["paths"][k])
+                setattr(self, k + "_sheet", cfg["sheets"][k])
+                getattr(self, k + "_label").configure(text=Path(cfg["paths"][k]).name or "Not selected")
+            for k in ("je", "tb_beg", "tb_end", "rf"):
+                getattr(self, k + "_header_var").set(str(headers[k]))
+                setattr(self, k + "_columns", columns.get(k, []))
+                box = getattr(self, k + "_map")
+                box.set_columns(columns.get(k, []))
+                for role, variable in box.vars.items():
+                    variable.set(cfg["mappings"][k][role])
+            for k in ("tb_beg", "tb_end"):
+                getattr(self, k + "_manual_source_var").set(cfg["manual_sources"][k])
+            self.tolerance_var.set(str(cfg["tolerance"]))
+            self.account_var.set(account)
+            self.account_combo["values"] = []
+            self.cache_directory_var.set(folder)
+            self.show_message("Configuration loaded", "Configuration restored. Load headers if worksheets have not been selected yet. Review mappings if the source files have changed.")
+        except Exception as exc:
+            self.show_error("Configuration error", str(exc))
 
     def active_dimensions(self):
         level = self.rf_level_var.get()
@@ -392,7 +548,11 @@ class App(tb.Window):
         self.tb_bu_hints[box].configure(text=hint)
 
     def _apply_progress(self, percentage, text):
+        if self.worker_running and self.cancel_event.is_set():
+            return
         percentage = max(0, min(float(percentage), 100))
+        if self.worker_running:
+            percentage = max(percentage, self.progress_var.get())
         self.progress_var.set(percentage)
         self.progress_text.config(text=text)
 
@@ -400,6 +560,7 @@ class App(tb.Window):
         if threading.current_thread() is threading.main_thread():
             self._apply_progress(percentage, text)
         else:
+            check_cancelled(self.cancel_event)
             self.ui_queue.put(("progress", percentage, text))
 
     def _process_ui_queue(self):
@@ -407,6 +568,10 @@ class App(tb.Window):
             while True:
                 item = self.ui_queue.get_nowait()
                 kind = item[0]
+                if kind in {"done", "error", "cache_done", "cache_error", "cancelled"}:
+                    self._finish_operation()
+                    if self.closing_requested:
+                        continue
                 if kind == "progress":
                     self._apply_progress(item[1], item[2])
                 elif kind == "done":
@@ -429,6 +594,9 @@ class App(tb.Window):
                     self.generate_button.config(state="normal", text="GENERATE WORKING PAPER")
                     self._apply_progress(0, "Cache build failed.")
                     self.show_error("Cache error", item[1])
+                elif kind == "cancelled":
+                    self._apply_progress(0, "Cancelled. Completed cache files are preserved.")
+                    self.show_message("Process cancelled", "The operation stopped. Completed cache files remain available.")
         except queue.Empty:
             pass
         finally:
@@ -436,6 +604,8 @@ class App(tb.Window):
 
 
     def add_je(self):
+        if self.worker_running:
+            return
         paths = filedialog.askopenfilenames(
             title="Select one or more JE files",
             filetypes=[("Excel files", "*.xlsx *.xlsm")]
@@ -448,6 +618,8 @@ class App(tb.Window):
             self.je_label.config(text=f"{len(self.je_files)} file(s): {names}")
 
     def pick_single(self, kind):
+        if self.worker_running:
+            return
         path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx *.xlsm")])
         if not path:
             return
@@ -509,7 +681,7 @@ class App(tb.Window):
 
     def confirm_close(self):
         message = (
-            "An operation is still running. Closing the application will interrupt it. "
+            "An operation is still running. It will be cancelled safely before closing. "
             "Do you want to close anyway?"
             if self.worker_running else
             "Do you want to close Tracing Validator? Your completed cache files will remain available."
@@ -530,6 +702,17 @@ class App(tb.Window):
                    command=accept).pack(side="right", padx=(20, 0))
         self._show_dialog(win, cancel)
         if result["close"]:
+            if self.worker_running:
+                self.closing_requested = True
+                self.cancel_operation()
+                self._close_when_stopped()
+            else:
+                self.destroy()
+
+    def _close_when_stopped(self):
+        if self.worker_running:
+            self.after(100, self._close_when_stopped)
+        else:
             self.destroy()
 
     def show_error(self, title, message):
@@ -538,6 +721,8 @@ class App(tb.Window):
     def show_message(self, title, message, error=False):
         accent = "#FF7474" if error else "#FFE600"
         subtitle = "Please review the details below." if error else "Operation completed successfully."
+        if title == "Process cancelled":
+            subtitle = "The operation has stopped safely."
         win, body = self._create_dialog(title, subtitle, accent)
         details = ttk.Frame(body)
         details.pack(fill="both", expand=True, pady=(0, 20))
@@ -583,6 +768,8 @@ class App(tb.Window):
         return result["sheet"]
 
     def load_files(self):
+        if self.worker_running:
+            return
         if not self.je_files or not self.tb_beg_path or not self.tb_end_path or not self.rf_path:
             self.show_error("Missing files",
                                  "Select JE(s), TB Beginning, TB Ending and Rollforward.")
@@ -683,7 +870,7 @@ class App(tb.Window):
                 "end_header": int(self.tb_end_header_var.get().strip()),
                 "rf_header": int(self.rf_header_var.get().strip()),
             }
-            self.worker_running = True
+            self._start_operation()
             self.generate_button.config(state="disabled")
             self._apply_progress(1, "Building persistent SQLite cache...")
             threading.Thread(target=self._build_cache_worker, daemon=True).start()
@@ -711,6 +898,7 @@ class App(tb.Window):
             total_sources = len(sources)
             cache_hits = 0
             for source_no, (label, path, sheet, header, gla_col) in enumerate(sources):
+                check_cancelled(self.cancel_event)
                 def cb(processed, total, unique_accounts, label=label, source_no=source_no):
                     frac = min(processed / max(total, 1), 1)
                     pct = 2 + 93 * ((source_no + frac) / total_sources)
@@ -727,7 +915,9 @@ class App(tb.Window):
                         f"{label}: cache already valid."
                     )
                 else:
-                    build_gla_index(path, sheet, header, gla_col, cb)
+                    build_gla_index(path, sheet, header, gla_col, cb, self.cancel_event,
+                                    lambda phase, label=label, n=source_no: self.set_progress(
+                                        2 + 93 * n / total_sources, f"Source {n + 1}/{total_sources} ? {label}: {phase}"))
 
             msg = (
                 f"Persistent SQLite cache is ready.\n\n"
@@ -737,6 +927,8 @@ class App(tb.Window):
                 f"Future tracings with these unchanged files will reuse the cache."
             )
             self.ui_queue.put(("cache_done", msg))
+        except OperationCancelled:
+            self.ui_queue.put(("cancelled",))
         except Exception as exc:
             self.ui_queue.put(("cache_error", str(exc)))
 
@@ -786,6 +978,8 @@ class App(tb.Window):
             self.validate_column(self.rf_map, role, self.rf_columns, "Rollforward")
 
     def refresh_accounts(self):
+        if self.worker_running:
+            return
         try:
             if not self.rf_sheet:
                 raise ValueError("Load workbook headers first.")
@@ -846,11 +1040,15 @@ class App(tb.Window):
                 )
             return callback
 
+        def phase_for(label, index):
+            return lambda phase: self.set_progress(
+                5 + 65 * index / total_sources,
+                f"Source {index + 1}/{total_sources} ? {label}: {phase}")
+
         def cache_status_for(label, index):
             def callback(cache_hit):
-                if cache_hit:
-                    overall = 5 + 65 * ((index + 0.25) / total_sources)
-                    self.set_progress(overall, f"{label}: persistent cache found; locating account...")
+                overall = 5 + 65 * ((index + 0.8) / total_sources)
+                self.set_progress(overall, f"Source {index + 1}/{total_sources} — {label}: querying account in SQLite...")
             return callback
 
         je_parts = []
@@ -859,7 +1057,7 @@ class App(tb.Window):
                 path, self.je_sheets[path], je_header, cfg["je"]["GLA"],
                 [], account,
                 callback_for(f"JE {n}/{len(self.je_files)}", source_index),
-                cache_status_for(f"JE {n}/{len(self.je_files)}", source_index)
+                cache_status_for(f"JE {n}/{len(self.je_files)}", source_index), self.cancel_event, phase_for(f"JE {n}/{len(self.je_files)}", source_index)
             )
             part["Source_File"] = Path(path).name
             je_parts.append(part)
@@ -874,7 +1072,7 @@ class App(tb.Window):
             self.tb_beg_path, self.tb_beg_sheet, beg_header,
             cfg["beg"]["GLA"], [], account,
             callback_for("TB Beginning", source_index),
-            cache_status_for("TB Beginning", source_index)
+            cache_status_for("TB Beginning", source_index), self.cancel_event, phase_for("TB Beginning", source_index)
         )
         source_index += 1
 
@@ -882,7 +1080,7 @@ class App(tb.Window):
             self.tb_end_path, self.tb_end_sheet, end_header,
             cfg["end"]["GLA"], [], account,
             callback_for("TB Ending", source_index),
-            cache_status_for("TB Ending", source_index)
+            cache_status_for("TB Ending", source_index), self.cancel_event, phase_for("TB Ending", source_index)
         )
         source_index += 1
 
@@ -890,7 +1088,7 @@ class App(tb.Window):
             self.rf_path, self.rf_sheet, rf_header,
             cfg["rf"]["GLA"], [], account,
             callback_for("Rollforward", source_index),
-            cache_status_for("Rollforward", source_index)
+            cache_status_for("Rollforward", source_index), self.cancel_event, phase_for("Rollforward", source_index)
         )
 
         return je_df, beg_df, end_df, rf_df
@@ -937,7 +1135,7 @@ class App(tb.Window):
                 "rf_header": int(self.rf_header_var.get().strip()),
             }
 
-            self.worker_running = True
+            self._start_operation()
             self.generate_button.config(state="disabled", text="PROCESSING...")
             self._apply_progress(2, "Starting background processing...")
 
@@ -954,6 +1152,7 @@ class App(tb.Window):
 
     def _generate_worker(self, account, tolerance, save_path):
         try:
+            check_cancelled(self.cancel_event)
             je_df, beg_df, end_df, rf_df = self.load_data_for_generation(account)
             self.set_progress(72, "Preparing filtered records...")
 
@@ -1010,6 +1209,7 @@ class App(tb.Window):
                 )
 
             self.set_progress(78, "Calculating validation totals...")
+            check_cancelled(self.cancel_event)
 
             group_cols = ["__GLA"]
             if "Business Unit" in dims:
@@ -1077,6 +1277,7 @@ class App(tb.Window):
                 errors="ignore")
 
             self.set_progress(86, "Writing the Excel working paper...")
+            check_cancelled(self.cancel_event)
             self.write_working_paper(
                 save_path, account, rf_original, beg_original,
                 end_original, je_original, val, tolerance
@@ -1091,11 +1292,24 @@ class App(tb.Window):
                 f"Rollforward rows: {len(rf):,}"
             )
             self.ui_queue.put(("done", save_path, summary))
-
+        except OperationCancelled:
+            self.ui_queue.put(("cancelled",))
         except Exception as exc:
             self.ui_queue.put(("error", str(exc)))
 
     def write_working_paper(self, path, account, rf_df, beg_df, end_df, je_df, val_df, tolerance):
+        destination = Path(path)
+        descriptor, temporary = tempfile.mkstemp(suffix=".xlsx", prefix=".tracing-", dir=destination.parent)
+        os.close(descriptor)
+        try:
+            self._write_working_paper(temporary, account, rf_df, beg_df, end_df, je_df, val_df, tolerance)
+            check_cancelled(self.cancel_event)
+            Path(temporary).replace(destination)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+
+    def _write_working_paper(self, path, account, rf_df, beg_df, end_df, je_df, val_df, tolerance):
+        check_cancelled(self.cancel_event)
         wb = Workbook()
         ws = wb.active
         ws.title = safe_sheet_name(f"Tracing {account}")
@@ -1115,6 +1329,7 @@ class App(tb.Window):
             return row + 1
 
         def write_df(start_row, df, header_fill=LIGHT_GRAY):
+            check_cancelled(self.cancel_event)
             headers = list(df.columns)
             for j, h in enumerate(headers, 1):
                 cell = ws.cell(start_row, j, h)
@@ -1122,6 +1337,9 @@ class App(tb.Window):
                 cell.fill = PatternFill("solid", fgColor=header_fill)
                 cell.border = Border(bottom=thin_gray)
             for i, values in enumerate(df.itertuples(index=False, name=None), start_row + 1):
+                if i % 1000 == 0:
+                    check_cancelled(self.cancel_event)
+                    self.set_progress(88, f"Writing detail rows: {i - start_row:,}/{len(df):,}")
                 for j, value in enumerate(values, 1):
                     ws.cell(i, j, value)
             return start_row + 1 + len(df), headers
@@ -1179,6 +1397,7 @@ class App(tb.Window):
             ("TB ENDING — DETAIL", end_df, cfg["end"]["Amount"]),
             ("JOURNAL ENTRIES — DETAIL", je_df, cfg["je"]["Amount"]),
         ]:
+            self.set_progress(88, f"Writing Excel — {title}")
             row = section_title(row, title)
             h = row
             row, headers = write_df(row, df, "D9EAF7")
@@ -1195,13 +1414,17 @@ class App(tb.Window):
             ws.column_dimensions[letter].width = min(max(max_len + 2, 11), 32)
 
         for cells in ws.iter_rows():
+            check_cancelled(self.cancel_event)
             for cell in cells:
                 if isinstance(cell.value, (int, float)) or (
                     isinstance(cell.value, str) and cell.value.startswith("=")
                 ):
                     cell.number_format = '#,##0.00;[Red](#,##0.00);-'
 
+        check_cancelled(self.cancel_event)
+        self.set_progress(96, "Saving and compressing Excel... cancellation will finish after this step.")
         wb.save(path)
+        wb.close()
 
 
 if __name__ == "__main__":
