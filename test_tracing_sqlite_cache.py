@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import threading
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -80,6 +81,26 @@ class SQLiteCacheTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             cache.set_cache_directory(self.root / "missing")
         self.assertEqual(cache.CACHE_ROOT, selected.resolve())
+
+    def test_cancellation_during_import_discards_only_incomplete_database(self):
+        event = threading.Event()
+        def cancel(*args):
+            event.set()
+        with self.assertRaises(cache.OperationCancelled):
+            cache.build_gla_index(self.path, "JE", 2, "GLA", cancel, event)
+        self.assertIsNone(cache.load_gla_index(self.path, "JE", 2, "GLA"))
+        self.assertEqual(list((self.root / "cache").iterdir()), [])
+        self.assertEqual(len(self.read(100)), 2)
+
+    def test_cancelled_query_keeps_completed_cache(self):
+        self.read(100)
+        event = threading.Event()
+        with self.assertRaises(cache.OperationCancelled):
+            cache.read_excel_filtered_by_gla(
+                self.path, "JE", 2, "GLA", [], 100,
+                cache_status_callback=lambda hit: event.set(), cancel_event=event)
+        self.assertIsNotNone(cache.load_gla_index(self.path, "JE", 2, "GLA"))
+        self.assertEqual(len(self.read(100)), 2)
 
 
 if __name__ == "__main__":
