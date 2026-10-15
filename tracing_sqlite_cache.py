@@ -17,6 +17,15 @@ CACHE_ROOT = None
 BATCH_SIZE = 2000
 
 
+class OperationCancelled(Exception):
+    pass
+
+
+def check_cancelled(cancel_event):
+    if cancel_event is not None and cancel_event.is_set():
+        raise OperationCancelled("Operation cancelled.")
+
+
 def set_cache_directory(directory):
     global CACHE_ROOT
     root = Path(directory).expanduser().resolve()
@@ -88,7 +97,10 @@ def load_gla_index(path, sheet, header_row, gla_column):
         return None
 
 
-def build_gla_index(path, sheet, header_row, gla_column, progress_callback=None):
+def build_gla_index(path, sheet, header_row, gla_column, progress_callback=None, cancel_event=None, phase_callback=None):
+    check_cancelled(cancel_event)
+    if phase_callback:
+        phase_callback("Opening Excel")
     if header_row < 1:
         raise ValueError("Header rows must be 1 or greater.")
     signature = file_signature(path)
@@ -124,7 +136,10 @@ def build_gla_index(path, sheet, header_row, gla_column, progress_callback=None)
         connection.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         batch, processed, imported = [], 0, 0
         total = max((worksheet.max_row or header_row) - header_row, 1)
+        if phase_callback:
+            phase_callback("Importing rows into SQLite")
         for processed, values in enumerate(rows, 1):
+            check_cancelled(cancel_event)
             values = tuple(values[:len(headers)])
             values += (None,) * (len(headers) - len(values))
             key = normalize_single_key(values[gla_position])
@@ -142,7 +157,17 @@ def build_gla_index(path, sheet, header_row, gla_column, progress_callback=None)
             connection.commit()
         if progress_callback:
             progress_callback(processed, max(processed, total), 0)
-        connection.execute("CREATE INDEX records_gla ON records(gla)")
+        check_cancelled(cancel_event)
+        if phase_callback:
+            phase_callback("Creating GLA index")
+        connection.set_progress_handler(
+            lambda: int(cancel_event is not None and cancel_event.is_set()), 1000)
+        try:
+            connection.execute("CREATE INDEX records_gla ON records(gla)")
+        except sqlite3.OperationalError:
+            check_cancelled(cancel_event)
+            raise
+        check_cancelled(cancel_event)
         if file_signature(path) != signature:
             raise ValueError("Source file changed during import. Please try again.")
         metadata = {"version": CACHE_VERSION, "headers": headers, "rows": imported}
@@ -152,8 +177,12 @@ def build_gla_index(path, sheet, header_row, gla_column, progress_callback=None)
         connection = None
         workbook.close()
         workbook = None
+        check_cancelled(cancel_event)
         temporary.replace(database)
         return metadata
+    except sqlite3.OperationalError:
+        check_cancelled(cancel_event)
+        raise
     finally:
         if connection is not None:
             connection.close()
@@ -162,24 +191,30 @@ def build_gla_index(path, sheet, header_row, gla_column, progress_callback=None)
         temporary.unlink(missing_ok=True)
 
 
-def get_or_build_gla_index(path, sheet, header_row, gla_column, progress_callback=None):
+def get_or_build_gla_index(path, sheet, header_row, gla_column, progress_callback=None, cancel_event=None, phase_callback=None):
+    check_cancelled(cancel_event)
     metadata = load_gla_index(path, sheet, header_row, gla_column)
     if metadata is not None:
         return metadata, True
-    return build_gla_index(path, sheet, header_row, gla_column, progress_callback), False
+    return build_gla_index(path, sheet, header_row, gla_column, progress_callback, cancel_event, phase_callback), False
 
 
 def read_excel_filtered_by_gla(path, sheet, header_row, gla_column,
                                selected_columns, target_gla, progress_callback=None,
-                               cache_status_callback=None):
-    metadata, hit = get_or_build_gla_index(path, sheet, header_row, gla_column, progress_callback)
+                               cache_status_callback=None, cancel_event=None, phase_callback=None):
+    metadata, hit = get_or_build_gla_index(path, sheet, header_row, gla_column, progress_callback, cancel_event, phase_callback)
     if cache_status_callback:
         cache_status_callback(hit)
     database = cache_path_for(path, sheet, header_row, gla_column)
     with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection:
+        check_cancelled(cancel_event)
         cursor = connection.execute(
             "SELECT payload FROM records WHERE gla=? ORDER BY row_number",
             (normalize_single_key(target_gla),))
+        def records():
+            for row in cursor:
+                check_cancelled(cancel_event)
+                yield json.loads(row[0], object_hook=_decode)
         return pd.DataFrame.from_records(
-            (json.loads(row[0], object_hook=_decode) for row in cursor),
+            records(),
             columns=metadata["headers"])
